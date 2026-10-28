@@ -1,11 +1,9 @@
 {
   "mcpServers": {
     "d365-dmf": {
-      "command": "uv",
+      "command": "uvx",
       "args": [
-        "run",
-        "--script",
-        "/path/to/d365-dmf-mcp/server.py"
+        "d365-dmf-mcp"
       ],
       "env": {
         "DMF_AZURE_TENANT_ID": "<entra-tenant-id>",

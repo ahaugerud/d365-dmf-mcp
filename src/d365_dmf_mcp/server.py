@@ -1,7 +1,3 @@
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["requests", "mcp<2", "openpyxl", "azure-identity>=1.25.3"]
-# ///
 """MCP server: import data files into / export data from D365 F&O Data Management (DMF).
 
 Auth is delegated Entra ID as the signed-in user: `az login` if available, otherwise an
@@ -326,5 +322,9 @@ def get_execution_status(execution_id: str) -> str:
     return f"{execution_id}: {st}{_details(s, execution_id, st)}"
 
 
-if __name__ == "__main__":
+def main() -> None:
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

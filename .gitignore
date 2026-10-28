@@ -1,3 +1,3 @@
 __pycache__/
-*.zip.tmp
 .venv/
+dist/

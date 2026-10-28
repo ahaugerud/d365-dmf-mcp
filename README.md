@@ -16,22 +16,16 @@ MCP server that imports CSV files into Dynamics 365 F&O via Data Management (DMF
    az login --tenant <entra-tenant-id>
    ```
 
-3. Clone this repo:
-
-   ```powershell
-   git clone git@github.com:ahaugerud/d365-dmf-mcp.git
-   ```
-
-4. Register the server with Claude Code, adjusting the path and values (see `.mcp.json.example`):
+3. Register the server with Claude Code (runs the published package via `uvx`; see `.mcp.json.example`):
 
    ```powershell
    claude mcp add d365-dmf `
      -e DMF_AZURE_TENANT_ID=<entra-tenant-id> `
      -e DMF_BASE_URL=https://<env>.sandbox.operations.eu.dynamics.com `
-     -- uv run --script C:\path\to\d365-dmf-mcp\server.py
+     -- uvx d365-dmf-mcp
    ```
 
-   Other MCP clients: copy the `env` block from `.mcp.json.example` into the client's MCP config.
+   Other MCP clients: copy the block from `.mcp.json.example` into the client's MCP config. To run from a local checkout instead, use `uvx --from C:\path\to\d365-dmf-mcp d365-dmf-mcp`.
 
 ## Tools
 
