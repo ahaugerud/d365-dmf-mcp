@@ -1,20 +1,22 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests", "mcp<2"]
+# dependencies = ["requests", "mcp<2", "openpyxl"]
 # ///
 """MVP MCP server: upload a CSV to a D365 F&O Data Management (DMF) import project.
 
 Auth is the signed-in user's `az login`. Config comes from env vars (set them in the
 `env` block of the MCP server definition, see .mcp.json.example):
   DMF_BASE_URL, DMF_DEFINITION_GROUP, DMF_COMPANY, DMF_TEMPLATE_ZIP, DMF_EXPORT_GROUP_NAME
-  (optional: DMF_POLL_INTERVAL_SECONDS=5, DMF_POLL_TIMEOUT_SECONDS=300)
+  (optional: DMF_POLL_INTERVAL_SECONDS=5, DMF_POLL_TIMEOUT_SECONDS=300,
+   DMF_TSV_FORMAT=TAB: name of the tab-delimited source data format defined in D365)
 Relative paths resolve against this script's directory.
 """
-import json, os, subprocess, time, uuid, zipfile
+import csv, io, json, os, re, subprocess, time, uuid, zipfile
 from datetime import datetime
 from pathlib import Path
 
 import requests
+from openpyxl import Workbook, load_workbook
 from mcp.server.fastmcp import FastMCP
 
 ROOT = Path(__file__).resolve().parent
@@ -64,18 +66,69 @@ def _call(s, action, body):
     return r.json()["value"]
 
 
-def _crlf(b: bytes) -> bytes:
-    return b.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+# format -> (file extension, D365 source data format name). The names must exist under
+# Data management > Framework parameters > Source data formats; TSV is a custom one.
+FORMATS = {
+    "CSV": (".csv", "CSV"),
+    "CSV-UNICODE": (".csv", "CSV-Unicode"),
+    "TSV": (".txt", os.environ.get("DMF_TSV_FORMAT", "TAB")),
+    "EXCEL": (".xlsx", "EXCEL"),
+}
+DELIMS = {".csv": ",", ".tsv": "\t", ".tab": "\t", ".txt": "\t"}
 
 
-def _build_package(csv: Path, group: str, zip_path: Path):
-    """Reuse manifest/header from an exported package, swap in our CSV."""
+def _read_rows(path: Path) -> list[list[str]]:
+    """Read a csv/tsv/xlsx file into rows of strings (input type by file extension)."""
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        ws = load_workbook(path, read_only=True, data_only=True).active
+        return [["" if c is None else str(c) for c in row] for row in ws.iter_rows(values_only=True)]
+    text = path.read_bytes().decode("utf-8-sig")
+    return list(csv.reader(io.StringIO(text, newline=""), delimiter=DELIMS.get(path.suffix.lower(), ",")))
+
+
+def _encode(rows: list[list[str]], fmt: str, sheet: str) -> bytes:
+    if fmt == "EXCEL":
+        wb = Workbook()
+        ws = wb.active
+        ws.title = sheet[:31] or "Sheet1"
+        for r in rows:
+            ws.append(r)
+        if rows:  # D365's own Excel files carry a named range over the header row
+            from openpyxl.utils import get_column_letter
+            from openpyxl.workbook.defined_name import DefinedName
+            ref = f"'{ws.title}'!$A$1:${get_column_letter(len(rows[0]))}$1"
+            wb.defined_names[ws.title] = DefinedName(ws.title, attr_text=ref)
+        out = io.BytesIO()
+        wb.save(out)
+        return out.getvalue()
+    buf = io.StringIO(newline="")
+    csv.writer(buf, delimiter="\t" if fmt == "TSV" else ",", lineterminator="\r\n").writerows(rows)  # DMF needs CRLF
+    return buf.getvalue().encode("utf-16" if fmt == "CSV-UNICODE" else "utf-8")
+
+
+def _fmt(fmt: str) -> str:
+    fmt = fmt.upper()
+    if fmt not in FORMATS:
+        raise ValueError(f"format must be one of {', '.join(FORMATS)}")
+    return fmt
+
+
+def _build_package(src: Path, group: str, zip_path: Path, fmt: str = "CSV"):
+    """Reuse manifest/header from an exported package; swap in our data file in the given format."""
+    ext, source_format = FORMATS[fmt]
     with zipfile.ZipFile(_path(CFG["template_zip"])) as zin, zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        data_name = next(n for n in zin.namelist() if n.lower().endswith(".csv"))
+        new_name = data_name[:-4] + ext
+        sheet = re.sub(r"\W", "_", data_name[:-4])[:31]  # D365 names the Excel sheet after the entity, with underscores
         for item in zin.infolist():
-            if item.filename.lower().endswith(".csv"):
-                zout.writestr(item.filename, _crlf(csv.read_bytes()))  # DMF needs CRLF
-            elif item.filename == "Manifest.xml":  # UTF-16; point at our import project
+            if item.filename == data_name:
+                zout.writestr(new_name, _encode(_read_rows(src), fmt, sheet))
+            elif item.filename == "Manifest.xml":  # UTF-16; point at our import project and format
                 xml = zin.read(item.filename).decode("utf-16").replace(CFG["export_group_name"], group)
+                xml = xml.replace(f"<InputFilePath>{data_name}<", f"<InputFilePath>{new_name}<")
+                xml = re.sub(r"<SourceFormat>[^<]*<", f"<SourceFormat>{source_format}<", xml)
+                if fmt == "EXCEL":
+                    xml = re.sub(r"<ExcelSheetName\s*/>", f"<ExcelSheetName>{sheet}</ExcelSheetName>", xml)
                 zout.writestr(item, xml.encode("utf-16"))
             else:
                 zout.writestr(item, zin.read(item.filename))
@@ -92,23 +145,27 @@ def _import_package(s, zip_path: Path, name: str, group: str, company: str, exec
 
 
 @mcp.tool()
-def import_csv(csv_path: str, definition_group: str | None = None, company: str | None = None,
-               wait: bool = True, dry_run: bool = False) -> str:
-    """Import a CSV file into D365 through an existing DMF data project, as the signed-in az user.
+def import_file(file_path: str, definition_group: str | None = None, company: str | None = None,
+                format: str = "CSV", wait: bool = True, dry_run: bool = False) -> str:
+    """Import a data file into D365 through an existing DMF data project, as the signed-in az user.
 
-    The CSV must match the entity of the template package configured in config.json.
-    Defaults for definition_group and company come from config.json.
+    The input may be .csv, .tsv/.txt (tab-delimited) or .xlsx (first sheet, header row first);
+    it is converted to the package `format`: CSV, CSV-UNICODE, TSV or EXCEL. The data project's
+    source data format must exist in D365 (TSV needs a custom tab-delimited format, see DMF_TSV_FORMAT).
+    Columns must match the entity of the template package. Defaults for definition_group and
+    company come from the server env config.
     With wait=True, polls until the import finishes (or the configured timeout); otherwise
     returns the execution id to check with get_import_status. dry_run only builds the package.
     """
     group = definition_group or CFG["definition_group"]
     company = company or CFG["company"]
-    csv = _path(csv_path)
-    if not csv.is_file():
-        raise FileNotFoundError(csv)
+    fmt = _fmt(format)
+    src = _path(file_path)
+    if not src.is_file():
+        raise FileNotFoundError(src)
     name = f"{group}-{datetime.now():%Y%m%d%H%M%S}"
     zip_path = Path(os.environ.get("TMPDIR", "/tmp")) / f"{name}.zip"
-    _build_package(csv, group, zip_path)
+    _build_package(src, group, zip_path, fmt)
     if dry_run:
         return f"Built {zip_path}"
 
@@ -125,14 +182,16 @@ def import_csv(csv_path: str, definition_group: str | None = None, company: str 
 
 
 @mcp.tool()
-def create_data_project(name: str, description: str = "", company: str | None = None) -> str:
+def create_data_project(name: str, description: str = "", company: str | None = None, format: str = "CSV") -> str:
     """Create a new DMF *import* data project for the entity of the configured template package.
 
     Creates the project, then loads the template package into it without executing, which
     defines the entity and field mapping from the package manifest. Fails if the name exists.
-    Afterwards use import_csv(csv_path, definition_group=name).
+    `format` (CSV, CSV-UNICODE, TSV, EXCEL) sets the project's source data format.
+    Afterwards use import_file(file_path, definition_group=name, format=format).
     """
     company = company or CFG["company"]
+    fmt = _fmt(format)
     s = _session()
     r = s.post(BASE + "/data/DataManagementDefinitionGroups", json={
         "Name": name, "OperationType": "Import", "ProjectCategory": "Integration",
@@ -142,15 +201,50 @@ def create_data_project(name: str, description: str = "", company: str | None = 
     zip_path = Path(os.environ.get("TMPDIR", "/tmp")) / f"{name}-setup-{datetime.now():%Y%m%d%H%M%S}.zip"
     with zipfile.ZipFile(_path(CFG["template_zip"])) as zin:
         _build_package(Path(zin.extract(next(n for n in zin.namelist() if n.lower().endswith(".csv")),
-                                        zip_path.parent / "dmf-tpl")), name, zip_path)
+                                        zip_path.parent / "dmf-tpl")), name, zip_path, fmt)
     _import_package(s, zip_path, zip_path.stem, name, company, execute=False)
     return f"Created data project {name}"
 
 
 @mcp.tool()
+def export_data(output_dir: str, definition_group: str | None = None, company: str | None = None) -> str:
+    """Run a DMF *export* data project and save the resulting package contents to output_dir.
+
+    Defaults to the template export project (DMF_EXPORT_GROUP_NAME). The data files are saved in
+    the project's own source format (CSV, TSV, Excel, ...). Returns the saved file paths.
+    """
+    group = definition_group or CFG["export_group_name"]
+    company = company or CFG["company"]
+    s = _session()
+    exec_id = f"mcp-{uuid.uuid4().hex[:12]}"
+    _call(s, "ExportToPackage", dict(definitionGroupId=group, packageName=exec_id, executionId=exec_id,
+                                     reExecute=False, legalEntityId=company))
+    deadline = time.time() + CFG["poll_timeout_seconds"]
+    while (st := _call(s, "GetExecutionSummaryStatus", {"executionId": exec_id})) not in DONE:
+        if time.time() > deadline:
+            return f"Export {exec_id} still {st} after timeout, use get_import_status"
+        time.sleep(CFG["poll_interval_seconds"])
+    if st != "Succeeded":
+        return f"Export {exec_id}: {st}"
+    r = requests.get(_call(s, "GetExportedPackageUrl", {"executionId": exec_id}))
+    r.raise_for_status()
+    out = _path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        files = [n for n in z.namelist() if n not in ("Manifest.xml", "PackageHeader.xml")]
+        for n in files:
+            (out / Path(n).name).write_bytes(z.read(n))
+    return "Saved: " + ", ".join(str(out / Path(n).name) for n in files)
+
+
+@mcp.tool()
 def get_import_status(execution_id: str) -> str:
-    """Get the status of a DMF execution (e.g. NotRun, Executing, Succeeded, PartiallySucceeded, Failed, Canceled)."""
-    return _call(_session(), "GetExecutionSummaryStatus", {"executionId": execution_id})
+    """Get the status of a DMF execution (NotRun, Executing, Succeeded, PartiallySucceeded, Failed, Canceled), with error details if it failed."""
+    s = _session()
+    st = _call(s, "GetExecutionSummaryStatus", {"executionId": execution_id})
+    if st in ("Failed", "PartiallySucceeded"):
+        st += "\nErrors: " + _call(s, "GetExecutionErrors", {"executionId": execution_id})
+    return st
 
 
 if __name__ == "__main__":

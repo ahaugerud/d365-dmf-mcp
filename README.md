@@ -38,11 +38,13 @@ MCP server that imports CSV files into Dynamics 365 F&O via Data Management (DMF
 
 ## Tools
 
-- `import_csv`: import a CSV into a data project and wait for the result.
+- `import_file`: import a .csv, .tsv or .xlsx file into a data project (as CSV, CSV-UNICODE, TSV or EXCEL package) and wait for the result.
+- `export_data`: run an export data project and save the files locally.
 - `create_data_project`: create a new import data project from the template package.
 - `get_import_status`: check the status of an execution.
 
 ## Notes
 
 - The CSV columns must match the entity in the template package (`template/`). To use another entity, export a package from a D365 data project and point `DMF_TEMPLATE_ZIP` and `DMF_EXPORT_GROUP_NAME` at it.
+- TSV needs a tab-delimited source data format in D365 (Framework parameters > Source data formats); set its name in `DMF_TSV_FORMAT` (default `TAB`).
 - Optional env vars: `DMF_POLL_INTERVAL_SECONDS` (default 5), `DMF_POLL_TIMEOUT_SECONDS` (default 300).
