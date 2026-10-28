@@ -7,8 +7,7 @@
 Auth is the signed-in user's `az login`. Config comes from env vars (set them in the
 `env` block of the MCP server definition, see .mcp.json.example):
   DMF_BASE_URL, DMF_DEFINITION_GROUP, DMF_COMPANY, DMF_TEMPLATE_ZIP, DMF_EXPORT_GROUP_NAME
-  (optional: DMF_POLL_INTERVAL_SECONDS=5, DMF_POLL_TIMEOUT_SECONDS=300,
-   DMF_TSV_FORMAT=TAB: name of the tab-delimited source data format defined in D365)
+  (optional: DMF_POLL_INTERVAL_SECONDS=5, DMF_POLL_TIMEOUT_SECONDS=300)
 Relative paths resolve against this script's directory.
 """
 import csv, io, json, os, re, subprocess, time, uuid, zipfile
@@ -66,28 +65,21 @@ def _call(s, action, body):
     return r.json()["value"]
 
 
-# format -> (file extension, D365 source data format name). The names must exist under
-# Data management > Framework parameters > Source data formats; TSV is a custom one.
-FORMATS = {
-    "CSV": (".csv", "CSV"),
-    "CSV-UNICODE": (".csv", "CSV-Unicode"),
-    "TSV": (".txt", os.environ.get("DMF_TSV_FORMAT", "TAB")),
-    "EXCEL": (".xlsx", "EXCEL"),
-}
-DELIMS = {".csv": ",", ".tsv": "\t", ".tab": "\t", ".txt": "\t"}
-
-
 def _read_rows(path: Path) -> list[list[str]]:
-    """Read a csv/tsv/xlsx file into rows of strings (input type by file extension)."""
+    """Read a csv/xlsx file into rows of strings (input type by file extension)."""
     if path.suffix.lower() in (".xlsx", ".xlsm"):
         ws = load_workbook(path, read_only=True, data_only=True).active
         return [["" if c is None else str(c) for c in row] for row in ws.iter_rows(values_only=True)]
     text = path.read_bytes().decode("utf-8-sig")
-    return list(csv.reader(io.StringIO(text, newline=""), delimiter=DELIMS.get(path.suffix.lower(), ",")))
+    return list(csv.reader(io.StringIO(text, newline="")))
+
+
+def _is_excel(fmt: str) -> bool:
+    return "EXCEL" in fmt.upper()
 
 
 def _encode(rows: list[list[str]], fmt: str, sheet: str) -> bytes:
-    if fmt == "EXCEL":
+    if _is_excel(fmt):
         wb = Workbook()
         ws = wb.active
         ws.title = sheet[:31] or "Sheet1"
@@ -102,20 +94,26 @@ def _encode(rows: list[list[str]], fmt: str, sheet: str) -> bytes:
         wb.save(out)
         return out.getvalue()
     buf = io.StringIO(newline="")
-    csv.writer(buf, delimiter="\t" if fmt == "TSV" else ",", lineterminator="\r\n").writerows(rows)  # DMF needs CRLF
-    return buf.getvalue().encode("utf-16" if fmt == "CSV-UNICODE" else "utf-8")
+    csv.writer(buf, lineterminator="\r\n").writerows(rows)  # DMF needs CRLF
+    return buf.getvalue().encode("utf-16" if "UNICODE" in fmt.upper() else "utf-8")  # *-Unicode formats are UTF-16
 
 
-def _fmt(fmt: str) -> str:
-    fmt = fmt.upper()
-    if fmt not in FORMATS:
-        raise ValueError(f"format must be one of {', '.join(FORMATS)}")
-    return fmt
+def _fmt(s, fmt: str) -> str:
+    """Resolve a free-text format to the D365 source data format name in use on the environment."""
+    r = s.get(BASE + "/data/DataManagementDefinitionGroupDetails", params={"$select": "SourceFormat"})
+    r.raise_for_status()
+    available = sorted({v["SourceFormat"] for v in r.json()["value"] if v["SourceFormat"]})
+    match = next((a for a in available if a.lower() == fmt.strip().lower()), None)
+    if not match:
+        raise ValueError(f"Unknown format '{fmt}'. In use on this D365 environment: {', '.join(available)}")
+    if not (_is_excel(match) or match.upper().startswith("CSV")):
+        raise ValueError(f"Format '{match}' is not supported by this server; use a CSV or Excel format")
+    return match
 
 
 def _build_package(src: Path, group: str, zip_path: Path, fmt: str = "CSV"):
     """Reuse manifest/header from an exported package; swap in our data file in the given format."""
-    ext, source_format = FORMATS[fmt]
+    ext = ".xlsx" if _is_excel(fmt) else ".csv"
     with zipfile.ZipFile(_path(CFG["template_zip"])) as zin, zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zout:
         data_name = next(n for n in zin.namelist() if n.lower().endswith(".csv"))
         new_name = data_name[:-4] + ext
@@ -126,8 +124,8 @@ def _build_package(src: Path, group: str, zip_path: Path, fmt: str = "CSV"):
             elif item.filename == "Manifest.xml":  # UTF-16; point at our import project and format
                 xml = zin.read(item.filename).decode("utf-16").replace(CFG["export_group_name"], group)
                 xml = xml.replace(f"<InputFilePath>{data_name}<", f"<InputFilePath>{new_name}<")
-                xml = re.sub(r"<SourceFormat>[^<]*<", f"<SourceFormat>{source_format}<", xml)
-                if fmt == "EXCEL":
+                xml = re.sub(r"<SourceFormat>[^<]*<", f"<SourceFormat>{fmt}<", xml)
+                if _is_excel(fmt):
                     xml = re.sub(r"<ExcelSheetName\s*/>", f"<ExcelSheetName>{sheet}</ExcelSheetName>", xml)
                 zout.writestr(item, xml.encode("utf-16"))
             else:
@@ -149,9 +147,10 @@ def import_file(file_path: str, definition_group: str | None = None, company: st
                 format: str = "CSV", wait: bool = True, dry_run: bool = False) -> str:
     """Import a data file into D365 through an existing DMF data project, as the signed-in az user.
 
-    The input may be .csv, .tsv/.txt (tab-delimited) or .xlsx (first sheet, header row first);
-    it is converted to the package `format`: CSV, CSV-UNICODE, TSV or EXCEL. The data project's
-    source data format must exist in D365 (TSV needs a custom tab-delimited format, see DMF_TSV_FORMAT).
+    The input may be a .csv or .xlsx (first sheet, header row first); it is converted to the
+    package `format`, which must match the data project's source data format in D365. Free text,
+    case-insensitive: "CSV" (default) and "EXCEL" are the common ones; others in use on the
+    environment (e.g. "CSV-Unicode") also work if CSV/Excel based. An unknown value returns the available ones.
     Columns must match the entity of the template package. Defaults for definition_group and
     company come from the server env config.
     With wait=True, polls until the import finishes (or the configured timeout); otherwise
@@ -159,17 +158,17 @@ def import_file(file_path: str, definition_group: str | None = None, company: st
     """
     group = definition_group or CFG["definition_group"]
     company = company or CFG["company"]
-    fmt = _fmt(format)
     src = _path(file_path)
     if not src.is_file():
         raise FileNotFoundError(src)
     name = f"{group}-{datetime.now():%Y%m%d%H%M%S}"
     zip_path = Path(os.environ.get("TMPDIR", "/tmp")) / f"{name}.zip"
+    s = _session()
+    fmt = _fmt(s, format)
     _build_package(src, group, zip_path, fmt)
     if dry_run:
         return f"Built {zip_path}"
 
-    s = _session()
     exec_id = _import_package(s, zip_path, name, group, company, execute=True)
     if not wait:
         return f"Triggered {exec_id}"
@@ -187,12 +186,12 @@ def create_data_project(name: str, description: str = "", company: str | None = 
 
     Creates the project, then loads the template package into it without executing, which
     defines the entity and field mapping from the package manifest. Fails if the name exists.
-    `format` (CSV, CSV-UNICODE, TSV, EXCEL) sets the project's source data format.
+    `format` (free text: "CSV" default, "EXCEL", or another D365 source format name) sets the project's source data format.
     Afterwards use import_file(file_path, definition_group=name, format=format).
     """
     company = company or CFG["company"]
-    fmt = _fmt(format)
     s = _session()
+    fmt = _fmt(s, format)
     r = s.post(BASE + "/data/DataManagementDefinitionGroups", json={
         "Name": name, "OperationType": "Import", "ProjectCategory": "Integration",
         "Description": description, "GenerateDataPackage": "No"})
@@ -211,7 +210,7 @@ def export_data(output_dir: str, definition_group: str | None = None, company: s
     """Run a DMF *export* data project and save the resulting package contents to output_dir.
 
     Defaults to the template export project (DMF_EXPORT_GROUP_NAME). The data files are saved in
-    the project's own source format (CSV, TSV, Excel, ...). Returns the saved file paths.
+    the project's own source format (CSV, Excel, ...). Returns the saved file paths.
     """
     group = definition_group or CFG["export_group_name"]
     company = company or CFG["company"]
