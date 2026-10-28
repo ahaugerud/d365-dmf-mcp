@@ -1,6 +1,6 @@
 [project]
 name = "d365-dmf-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local, single-user MCP server to import/export data via Dynamics 365 F&O Data Management (DMF), authenticated as you via Entra ID"
 readme = "README.md"
 license = "MIT"
