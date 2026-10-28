@@ -4,8 +4,11 @@
 # ///
 """MVP MCP server: upload a CSV to a D365 F&O Data Management (DMF) import project.
 
-Auth is the signed-in user's `az login`. Config comes from config.json
-(or the file named by $DMF_MCP_CONFIG); relative paths resolve against it.
+Auth is the signed-in user's `az login`. Config comes from env vars (set them in the
+`env` block of the MCP server definition, see .mcp.json.example):
+  DMF_BASE_URL, DMF_DEFINITION_GROUP, DMF_COMPANY, DMF_TEMPLATE_ZIP, DMF_EXPORT_GROUP_NAME
+  (optional: DMF_POLL_INTERVAL_SECONDS=5, DMF_POLL_TIMEOUT_SECONDS=300)
+Relative paths resolve against this script's directory.
 """
 import json, os, subprocess, time, uuid, zipfile
 from datetime import datetime
@@ -14,8 +17,25 @@ from pathlib import Path
 import requests
 from mcp.server.fastmcp import FastMCP
 
-CONFIG_PATH = Path(os.environ.get("DMF_MCP_CONFIG") or Path(__file__).with_name("config.json")).resolve()
-CFG = json.loads(CONFIG_PATH.read_text())
+ROOT = Path(__file__).resolve().parent
+
+
+def _env(key: str, default: str | None = None) -> str:
+    v = os.environ.get(key, default)
+    if v is None:
+        raise SystemExit(f"Missing required env var {key}")
+    return v
+
+
+CFG = {
+    "base_url": _env("DMF_BASE_URL"),
+    "definition_group": _env("DMF_DEFINITION_GROUP"),
+    "company": _env("DMF_COMPANY"),
+    "template_zip": _env("DMF_TEMPLATE_ZIP"),
+    "export_group_name": _env("DMF_EXPORT_GROUP_NAME"),
+    "poll_interval_seconds": float(_env("DMF_POLL_INTERVAL_SECONDS", "5")),
+    "poll_timeout_seconds": float(_env("DMF_POLL_TIMEOUT_SECONDS", "300")),
+}
 BASE = CFG["base_url"].rstrip("/")
 ACTIONS = BASE + "/data/DataManagementDefinitionGroups/Microsoft.Dynamics.DataEntities."
 DONE = ("Succeeded", "PartiallySucceeded", "Failed", "Canceled")
@@ -25,7 +45,7 @@ mcp = FastMCP("d365-dmf")
 
 def _path(p: str) -> Path:
     p = Path(p).expanduser()
-    return p if p.is_absolute() else CONFIG_PATH.parent / p
+    return p if p.is_absolute() else ROOT / p
 
 
 def _session() -> requests.Session:
