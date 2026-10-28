@@ -7,8 +7,8 @@
 Auth is delegated Entra ID as the signed-in user: `az login` if available, otherwise an
 interactive browser login (same mechanism as sql-server-mcp), pinned to DMF_AZURE_TENANT_ID.
 Config comes from env vars (set them in the `env` block of the MCP server definition, see .mcp.json.example):
-  DMF_AZURE_TENANT_ID, DMF_BASE_URL, DMF_DEFINITION_GROUP, DMF_COMPANY,
-  DMF_TEMPLATE_ZIP, DMF_EXPORT_GROUP_NAME
+  DMF_AZURE_TENANT_ID, DMF_BASE_URL
+Project, company and template package are tool arguments, not config.
   (optional: DMF_POLL_INTERVAL_SECONDS=5, DMF_POLL_TIMEOUT_SECONDS=300)
 Relative paths resolve against this script's directory.
 """
@@ -35,10 +35,6 @@ def _env(key: str, default: str | None = None) -> str:
 CFG = {
     "tenant_id": _env("DMF_AZURE_TENANT_ID"),
     "base_url": _env("DMF_BASE_URL"),
-    "definition_group": _env("DMF_DEFINITION_GROUP"),
-    "company": _env("DMF_COMPANY"),
-    "template_zip": _env("DMF_TEMPLATE_ZIP"),
-    "export_group_name": _env("DMF_EXPORT_GROUP_NAME"),
     "poll_interval_seconds": float(_env("DMF_POLL_INTERVAL_SECONDS", "5")),
     "poll_timeout_seconds": float(_env("DMF_POLL_TIMEOUT_SECONDS", "300")),
 }
@@ -133,10 +129,10 @@ def _fmt(s, fmt: str) -> str:
     return match
 
 
-def _build_package(src: Path, group: str, zip_path: Path, fmt: str = "CSV"):
+def _build_package(src: Path, group: str, zip_path: Path, template: str, fmt: str = "CSV"):
     """Reuse manifest/header from an exported package; swap in our data file in the given format."""
     ext = ".xlsx" if _is_excel(fmt) else ".csv"
-    with zipfile.ZipFile(_path(CFG["template_zip"])) as zin, zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zout:
+    with zipfile.ZipFile(_path(template)) as zin, zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zout:
         data_name = next(n for n in zin.namelist() if n.lower().endswith(".csv"))
         new_name = data_name[:-4] + ext
         sheet = re.sub(r"\W", "_", data_name[:-4])[:31]  # D365 names the Excel sheet after the entity, with underscores
@@ -144,7 +140,8 @@ def _build_package(src: Path, group: str, zip_path: Path, fmt: str = "CSV"):
             if item.filename == data_name:
                 zout.writestr(new_name, _encode(_read_rows(src), fmt, sheet))
             elif item.filename == "Manifest.xml":  # UTF-16; point at our import project and format
-                xml = zin.read(item.filename).decode("utf-16").replace(CFG["export_group_name"], group)
+                xml = zin.read(item.filename).decode("utf-16")
+                xml = xml.replace(re.search(r"<DefinitionGroupName>([^<]*)<", xml).group(1), group)
                 xml = xml.replace(f"<InputFilePath>{data_name}<", f"<InputFilePath>{new_name}<")
                 xml = re.sub(r"<SourceFormat>[^<]*<", f"<SourceFormat>{fmt}<", xml)
                 if _is_excel(fmt):
@@ -165,21 +162,21 @@ def _import_package(s, zip_path: Path, name: str, group: str, company: str, exec
 
 
 @mcp.tool()
-def import_file(file_path: str, definition_group: str | None = None, company: str | None = None,
+def import_file(file_path: str, definition_group: str, company: str, template_package: str,
                 format: str = "CSV", wait: bool = True, dry_run: bool = False) -> str:
-    """Import a data file into D365 through an existing DMF data project, as the signed-in az user.
+    """Import a data file into D365 through an existing DMF data project, as the signed-in user.
 
     The input may be a .csv or .xlsx (first sheet, header row first); it is converted to the
     package `format`, which must match the data project's source data format in D365. Free text,
     case-insensitive: "CSV" (default) and "EXCEL" are the common ones; others in use on the
     environment (e.g. "CSV-Unicode") also work if CSV/Excel based. An unknown value returns the available ones.
-    Columns must match the entity of the template package. Defaults for definition_group and
-    company come from the server env config.
+    `definition_group` is the data project name, `company` the legal entity id (e.g. USMF).
+    `template_package` is the path to a DMF package zip exported for the same entity (export_data
+    saves one); its manifest supplies the entity mapping, and the file's columns must match it.
     With wait=True, polls until the import finishes (or the configured timeout); otherwise
     returns the execution id to check with get_import_status. dry_run only builds the package.
     """
-    group = definition_group or CFG["definition_group"]
-    company = company or CFG["company"]
+    group = definition_group
     src = _path(file_path)
     if not src.is_file():
         raise FileNotFoundError(src)
@@ -187,31 +184,31 @@ def import_file(file_path: str, definition_group: str | None = None, company: st
     zip_path = Path(os.environ.get("TMPDIR", "/tmp")) / f"{name}.zip"
     s = _session()
     fmt = _fmt(s, format)
-    _build_package(src, group, zip_path, fmt)
+    _build_package(src, group, zip_path, template_package, fmt)
     if dry_run:
         return f"Built {zip_path}"
 
     exec_id = _import_package(s, zip_path, name, group, company, execute=True)
     if not wait:
         return f"Triggered {exec_id}"
-    deadline = time.time() + CFG.get("poll_timeout_seconds", 300)
+    deadline = time.time() + CFG["poll_timeout_seconds"]
     while (st := _call(s, "GetExecutionSummaryStatus", {"executionId": exec_id})) not in DONE:
         if time.time() > deadline:
             return f"Triggered {exec_id}; still {st} after timeout, use get_import_status"
-        time.sleep(CFG.get("poll_interval_seconds", 5))
+        time.sleep(CFG["poll_interval_seconds"])
     return f"{exec_id}: {st}"
 
 
 @mcp.tool()
-def create_data_project(name: str, description: str = "", company: str | None = None, format: str = "CSV") -> str:
-    """Create a new DMF *import* data project for the entity of the configured template package.
+def create_data_project(name: str, company: str, template_package: str, description: str = "",
+                        format: str = "CSV") -> str:
+    """Create a new DMF *import* data project for the entity in `template_package` (a DMF package zip, e.g. saved by export_data).
 
     Creates the project, then loads the template package into it without executing, which
     defines the entity and field mapping from the package manifest. Fails if the name exists.
     `format` (free text: "CSV" default, "EXCEL", or another D365 source format name) sets the project's source data format.
-    Afterwards use import_file(file_path, definition_group=name, format=format).
+    Afterwards use import_file(file_path, definition_group=name, ..., format=format).
     """
-    company = company or CFG["company"]
     s = _session()
     fmt = _fmt(s, format)
     r = s.post(BASE + "/data/DataManagementDefinitionGroups", json={
@@ -220,22 +217,22 @@ def create_data_project(name: str, description: str = "", company: str | None = 
     if not r.ok:
         raise RuntimeError(f"Create project failed: {r.status_code} {r.text}")
     zip_path = Path(os.environ.get("TMPDIR", "/tmp")) / f"{name}-setup-{datetime.now():%Y%m%d%H%M%S}.zip"
-    with zipfile.ZipFile(_path(CFG["template_zip"])) as zin:
+    with zipfile.ZipFile(_path(template_package)) as zin:
         _build_package(Path(zin.extract(next(n for n in zin.namelist() if n.lower().endswith(".csv")),
-                                        zip_path.parent / "dmf-tpl")), name, zip_path, fmt)
+                                        zip_path.parent / "dmf-tpl")), name, zip_path, template_package, fmt)
     _import_package(s, zip_path, zip_path.stem, name, company, execute=False)
     return f"Created data project {name}"
 
 
 @mcp.tool()
-def export_data(output_dir: str, definition_group: str | None = None, company: str | None = None) -> str:
+def export_data(output_dir: str, definition_group: str, company: str) -> str:
     """Run a DMF *export* data project and save the resulting package contents to output_dir.
 
-    Defaults to the template export project (DMF_EXPORT_GROUP_NAME). The data files are saved in
-    the project's own source format (CSV, Excel, ...). Returns the saved file paths.
+    The data files are saved in the project's own source format (CSV, Excel, ...), and the whole
+    package is saved as "<definition_group>-package.zip", usable as `template_package` for
+    import_file / create_data_project. Returns the saved file paths.
     """
-    group = definition_group or CFG["export_group_name"]
-    company = company or CFG["company"]
+    group = definition_group
     s = _session()
     exec_id = f"mcp-{uuid.uuid4().hex[:12]}"
     _call(s, "ExportToPackage", dict(definitionGroupId=group, packageName=exec_id, executionId=exec_id,
@@ -251,11 +248,13 @@ def export_data(output_dir: str, definition_group: str | None = None, company: s
     r.raise_for_status()
     out = _path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    pkg = out / f"{group}-package.zip"
+    pkg.write_bytes(r.content)
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         files = [n for n in z.namelist() if n not in ("Manifest.xml", "PackageHeader.xml")]
         for n in files:
             (out / Path(n).name).write_bytes(z.read(n))
-    return "Saved: " + ", ".join(str(out / Path(n).name) for n in files)
+    return "Saved: " + ", ".join([str(pkg)] + [str(out / Path(n).name) for n in files])
 
 
 @mcp.tool()
