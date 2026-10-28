@@ -35,15 +35,14 @@ MCP server that imports CSV files into Dynamics 365 F&O via Data Management (DMF
 
 ## Tools
 
-Only the tenant and environment URL are config. Data project, company and template are passed per call.
+Only the tenant and environment URL are config. Everything else is passed per call.
 
-- `export_data(output_dir, definition_group, company)`: run an export data project and save the files, plus the whole package as `<project>-package.zip`.
-- `import_file(file_path, definition_group, company, template_package, format="CSV")`: import a .csv or .xlsx file into a data project and wait for the result. `template_package` is a package zip for the same entity, e.g. the one `export_data` saved. `format` is free text (`CSV`, `EXCEL`, or any CSV/Excel-based D365 source format on the environment, e.g. `CSV-Unicode`).
-- `create_data_project(name, company, template_package, format="CSV")`: create a new import data project for the entity in the template package.
-- `get_import_status(execution_id)`: check the status of an execution, with errors if it failed.
+- `import_data(definition_group, company, files, format="CSV")`: import one or more files into a data project and wait for the result. `files` is a list of `{entity, file_path}`; `entity` is the DMF entity name as shown in D365 (e.g. `Customer groups`) and the file (`.csv` or `.xlsx`) has the entity's field names (e.g. `CUSTOMERGROUPID`) in its first row. The server generates the package manifest, looks up each entity's target and the dependency order from D365, and creates the data project if it doesn't exist. `format` is free text (`CSV`, `EXCEL`, or any CSV/Excel-based D365 source format on the environment, e.g. `CSV-Unicode`).
+- `export_data(output_dir, definition_group, company)`: run an existing export data project and save its files.
+- `create_data_project(name, description="")`: create an empty import data project (optional; `import_data` does this itself).
+- `get_execution_status(execution_id)`: check the status of an execution, with errors if it failed.
 
 ## Notes
 
-- To get a template for a new entity, create an export data project for it in D365 and run `export_data` on it.
-- The data project's source data format must match `format`. Use `create_data_project` with the same format to get a matching project.
+- Composite and XML-based entities are not supported.
 - Optional env vars: `DMF_POLL_INTERVAL_SECONDS` (default 5), `DMF_POLL_TIMEOUT_SECONDS` (default 300).

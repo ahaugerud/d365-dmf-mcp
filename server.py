@@ -2,27 +2,28 @@
 # requires-python = ">=3.10"
 # dependencies = ["requests", "mcp<2", "openpyxl", "azure-identity>=1.25.3"]
 # ///
-"""MVP MCP server: upload a CSV to a D365 F&O Data Management (DMF) import project.
+"""MCP server: import data files into / export data from D365 F&O Data Management (DMF).
 
 Auth is delegated Entra ID as the signed-in user: `az login` if available, otherwise an
 interactive browser login (same mechanism as sql-server-mcp), pinned to DMF_AZURE_TENANT_ID.
-Config comes from env vars (set them in the `env` block of the MCP server definition, see .mcp.json.example):
+Config comes from env vars (set them in the `env` block of the MCP server definition,
+see .mcp.json.example):
   DMF_AZURE_TENANT_ID, DMF_BASE_URL
-Project, company and template package are tool arguments, not config.
   (optional: DMF_POLL_INTERVAL_SECONDS=5, DMF_POLL_TIMEOUT_SECONDS=300)
-Relative paths resolve against this script's directory.
+Everything else (data project, company, entities, files, format) is passed per tool call.
 """
 import csv, io, json, os, re, sys, time, uuid, zipfile
-from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import requests
 from azure.core.exceptions import ClientAuthenticationError
 from azure.identity import AzureCliCredential, InteractiveBrowserCredential
-from openpyxl import Workbook, load_workbook
 from mcp.server.fastmcp import FastMCP
-
-ROOT = Path(__file__).resolve().parent
+from openpyxl import Workbook, load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
+from pydantic import BaseModel
 
 
 def _env(key: str, default: str | None = None) -> str:
@@ -32,23 +33,23 @@ def _env(key: str, default: str | None = None) -> str:
     return v
 
 
-CFG = {
-    "tenant_id": _env("DMF_AZURE_TENANT_ID"),
-    "base_url": _env("DMF_BASE_URL"),
-    "poll_interval_seconds": float(_env("DMF_POLL_INTERVAL_SECONDS", "5")),
-    "poll_timeout_seconds": float(_env("DMF_POLL_TIMEOUT_SECONDS", "300")),
-}
-BASE = CFG["base_url"].rstrip("/")
+TENANT = _env("DMF_AZURE_TENANT_ID")
+BASE = _env("DMF_BASE_URL").rstrip("/")
+POLL_INTERVAL = float(_env("DMF_POLL_INTERVAL_SECONDS", "5"))
+POLL_TIMEOUT = float(_env("DMF_POLL_TIMEOUT_SECONDS", "300"))
 ACTIONS = BASE + "/data/DataManagementDefinitionGroups/Microsoft.Dynamics.DataEntities."
 DONE = ("Succeeded", "PartiallySucceeded", "Failed", "Canceled")
+NS = "http://schemas.microsoft.com/dynamics/2015/01/DataManagement"
 
 mcp = FastMCP("d365-dmf")
 
 
-def _path(p: str) -> Path:
-    p = Path(p).expanduser()
-    return p if p.is_absolute() else ROOT / p
+class EntityFile(BaseModel):
+    entity: str  # DMF entity name as shown in D365, e.g. "Customer groups"
+    file_path: str  # .csv or .xlsx; first row = column (field) names
 
+
+# ---------------------------------------------------------------- auth / http
 
 _credential = None
 
@@ -59,14 +60,14 @@ def _token() -> str:
     global _credential
     scope = BASE + "/.default"
     if _credential is None:
-        cli = AzureCliCredential(tenant_id=CFG["tenant_id"])
+        cli = AzureCliCredential(tenant_id=TENANT)
         try:
             cli.get_token(scope)
             _credential = cli
         except ClientAuthenticationError:
-            sys.stderr.write(f"No active `az login` session for tenant {CFG['tenant_id']!r} - "
+            sys.stderr.write(f"No active `az login` session for tenant {TENANT!r} - "
                              "falling back to an interactive browser login.\n")
-            _credential = InteractiveBrowserCredential(tenant_id=CFG["tenant_id"])
+            _credential = InteractiveBrowserCredential(tenant_id=TENANT)
     return _credential.get_token(scope).token
 
 
@@ -83,6 +84,32 @@ def _call(s, action, body):
     return r.json()["value"]
 
 
+def _get(s, path, **params):
+    r = s.get(BASE + "/data/" + path, params=params)
+    if not r.ok:
+        raise RuntimeError(f"GET {path} failed: {r.status_code} {r.text}")
+    return r.json()["value"]
+
+
+def _q(v: str) -> str:
+    return v.replace("'", "''")
+
+
+def _wait(s, exec_id: str) -> str:
+    deadline = time.time() + POLL_TIMEOUT
+    while (st := _call(s, "GetExecutionSummaryStatus", {"executionId": exec_id})) not in DONE:
+        if time.time() > deadline:
+            return f"{exec_id}: still {st} after timeout, use get_execution_status"
+        time.sleep(POLL_INTERVAL)
+    return f"{exec_id}: {st}"
+
+
+# ------------------------------------------------------------ files / formats
+
+def _path(p: str) -> Path:
+    return Path(p).expanduser()
+
+
 def _read_rows(path: Path) -> list[list[str]]:
     """Read a csv/xlsx file into rows of strings (input type by file extension)."""
     if path.suffix.lower() in (".xlsx", ".xlsm"):
@@ -96,16 +123,18 @@ def _is_excel(fmt: str) -> bool:
     return "EXCEL" in fmt.upper()
 
 
-def _encode(rows: list[list[str]], fmt: str, sheet: str) -> bytes:
+def _sheet_name(entity: str) -> str:
+    return re.sub(r"\W", "_", entity)[:31]  # D365 names the Excel sheet after the entity, with underscores
+
+
+def _encode(rows: list[list[str]], fmt: str, entity: str) -> bytes:
     if _is_excel(fmt):
         wb = Workbook()
         ws = wb.active
-        ws.title = sheet[:31] or "Sheet1"
+        ws.title = _sheet_name(entity)
         for r in rows:
             ws.append(r)
         if rows:  # D365's own Excel files carry a named range over the header row
-            from openpyxl.utils import get_column_letter
-            from openpyxl.workbook.defined_name import DefinedName
             ref = f"'{ws.title}'!$A$1:${get_column_letter(len(rows[0]))}$1"
             wb.defined_names[ws.title] = DefinedName(ws.title, attr_text=ref)
         out = io.BytesIO()
@@ -118,9 +147,8 @@ def _encode(rows: list[list[str]], fmt: str, sheet: str) -> bytes:
 
 def _fmt(s, fmt: str) -> str:
     """Resolve a free-text format to the D365 source data format name in use on the environment."""
-    r = s.get(BASE + "/data/DataManagementDefinitionGroupDetails", params={"$select": "SourceFormat"})
-    r.raise_for_status()
-    available = sorted({v["SourceFormat"] for v in r.json()["value"] if v["SourceFormat"]})
+    available = sorted({v["SourceFormat"] for v in _get(s, "DataManagementDefinitionGroupDetails", **{"$select": "SourceFormat"})
+                        if v["SourceFormat"]})
     match = next((a for a in available if a.lower() == fmt.strip().lower()), None)
     if not match:
         raise ValueError(f"Unknown format '{fmt}'. In use on this D365 environment: {', '.join(available)}")
@@ -129,137 +157,161 @@ def _fmt(s, fmt: str) -> str:
     return match
 
 
-def _build_package(src: Path, group: str, zip_path: Path, template: str, fmt: str = "CSV"):
-    """Reuse manifest/header from an exported package; swap in our data file in the given format."""
+# ------------------------------------------------------------------- package
+
+def _resolve_entities(s, entities: list[str]) -> dict[str, dict]:
+    """Entity name -> {target, unit, level, seq}: AOT target entity and execution order from D365."""
+    targets = {}
+    for e in entities:
+        rows = _get(s, "DataManagementEntities", **{"$filter": f"EntityName eq '{_q(e)}'", "$select": "EntityName,TargetName"})
+        if not rows:
+            raise ValueError(f"Unknown DMF entity '{e}' (use the entity name as shown in D365 Data management)")
+        targets[e] = rows[0]["TargetName"]
+    # "Name-ExecutionUnit-Level-Sequence,..." in dependency order
+    seq = _call(s, "GetEntitySequence", {"listOfDataEntities": ",".join(entities)})
+    order = {}
+    for part in filter(None, seq.split(",")):
+        name, unit, level, n = part.rsplit("-", 3)
+        order[name] = dict(unit=int(unit), level=int(level), seq=int(n))
+    return {e: dict(target=targets[e], **order[e]) for e in entities}
+
+
+def _manifest(group: str, fmt: str, entities: dict[str, dict], filenames: dict[str, str]) -> str:
+    items = ""
+    for e, info in entities.items():
+        sheet = f"<ExcelSheetName>{escape(_sheet_name(e))}</ExcelSheetName>" if _is_excel(fmt) else "<ExcelSheetName />"
+        items += (
+            "<DataManagementPackageEntityData><DefaultRefreshType>IncrementalPush</DefaultRefreshType>"
+            "<Disable>false</Disable><EntityMapList />"
+            f"<EntityName>{escape(e)}</EntityName><EntityTransformList i:nil=\"true\" />{sheet}"
+            f"<ExecutionUnit>{info['unit']}</ExecutionUnit><FailExecutionUnitOnError>false</FailExecutionUnitOnError>"
+            f"<FailLevelOnError>false</FailLevelOnError><InputFilePath>{escape(filenames[e])}</InputFilePath>"
+            f"<LevelInExecutionUnit>{info['level']}</LevelInExecutionUnit><QueryData />"
+            "<QueryFilter i:nil=\"true\" /><RunBusinessLogic>true</RunBusinessLogic>"
+            "<RunBusinessValidation>true</RunBusinessValidation><SampleFilePath />"
+            f"<SequenceInLevel>{info['seq']}</SequenceInLevel><SourceFormat>{escape(fmt)}</SourceFormat>"
+            f"<TargetEntity>{escape(info['target'])}</TargetEntity><ValidationStatus>Yes</ValidationStatus>"
+            "</DataManagementPackageEntityData>")
+    return (f'<DataManagementPackageManifest xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="{NS}">'
+            f"<DefinitionGroupName>{escape(group)}</DefinitionGroupName><Description>{escape(group)}</Description>"
+            f"<PackageEntityList>{items}</PackageEntityList><ProjectCategory>0</ProjectCategory>"
+            '<RulesData i:nil="true" /></DataManagementPackageManifest>')
+
+
+def _header(group: str) -> str:
+    return (f'<DataManagementPackageHeader xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="{NS}">'
+            f"<Description>{escape(group)}</Description><ManifestType>Microsoft.Dynamics.AX.Framework.Tools."
+            "DataManagement.Serialization.DataManagementPackageManifest</ManifestType>"
+            "<PackageType>DefinitionGroup</PackageType><PackageVersion>2</PackageVersion></DataManagementPackageHeader>")
+
+
+def _build_package(group: str, fmt: str, entities: dict[str, dict], files: dict[str, Path]) -> bytes:
     ext = ".xlsx" if _is_excel(fmt) else ".csv"
-    with zipfile.ZipFile(_path(template)) as zin, zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zout:
-        data_name = next(n for n in zin.namelist() if n.lower().endswith(".csv"))
-        new_name = data_name[:-4] + ext
-        sheet = re.sub(r"\W", "_", data_name[:-4])[:31]  # D365 names the Excel sheet after the entity, with underscores
-        for item in zin.infolist():
-            if item.filename == data_name:
-                zout.writestr(new_name, _encode(_read_rows(src), fmt, sheet))
-            elif item.filename == "Manifest.xml":  # UTF-16; point at our import project and format
-                xml = zin.read(item.filename).decode("utf-16")
-                xml = xml.replace(re.search(r"<DefinitionGroupName>([^<]*)<", xml).group(1), group)
-                xml = xml.replace(f"<InputFilePath>{data_name}<", f"<InputFilePath>{new_name}<")
-                xml = re.sub(r"<SourceFormat>[^<]*<", f"<SourceFormat>{fmt}<", xml)
-                if _is_excel(fmt):
-                    xml = re.sub(r"<ExcelSheetName\s*/>", f"<ExcelSheetName>{sheet}</ExcelSheetName>", xml)
-                zout.writestr(item, xml.encode("utf-16"))
-            else:
-                zout.writestr(item, zin.read(item.filename))
+    filenames = {e: re.sub(r'[\\/:*?"<>|]', "_", e) + ext for e in entities}
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Manifest.xml", _manifest(group, fmt, entities, filenames).encode("utf-16"))
+        z.writestr("PackageHeader.xml", _header(group).encode("utf-16"))
+        for e, path in files.items():
+            z.writestr(filenames[e], _encode(_read_rows(path), fmt, e))
+    return out.getvalue()
 
 
-def _import_package(s, zip_path: Path, name: str, group: str, company: str, execute: bool) -> str:
-    blob = json.loads(_call(s, "GetAzureWriteUrl", {"uniqueFileName": name}))["BlobUrl"]
-    requests.put(blob, data=zip_path.read_bytes(), headers={"x-ms-blob-type": "BlockBlob"}).raise_for_status()
-    zip_path.unlink(missing_ok=True)
-    exec_id = f"mcp-{uuid.uuid4().hex[:12]}"
-    _call(s, "ImportFromPackage", dict(packageUrl=blob, definitionGroupId=group, executionId=exec_id,
-                                       execute=execute, overwrite=True, legalEntityId=company))
-    return exec_id
-
-
-@mcp.tool()
-def import_file(file_path: str, definition_group: str, company: str, template_package: str,
-                format: str = "CSV", wait: bool = True, dry_run: bool = False) -> str:
-    """Import a data file into D365 through an existing DMF data project, as the signed-in user.
-
-    The input may be a .csv or .xlsx (first sheet, header row first); it is converted to the
-    package `format`, which must match the data project's source data format in D365. Free text,
-    case-insensitive: "CSV" (default) and "EXCEL" are the common ones; others in use on the
-    environment (e.g. "CSV-Unicode") also work if CSV/Excel based. An unknown value returns the available ones.
-    `definition_group` is the data project name, `company` the legal entity id (e.g. USMF).
-    `template_package` is the path to a DMF package zip exported for the same entity (export_data
-    saves one); its manifest supplies the entity mapping, and the file's columns must match it.
-    With wait=True, polls until the import finishes (or the configured timeout); otherwise
-    returns the execution id to check with get_import_status. dry_run only builds the package.
-    """
-    group = definition_group
-    src = _path(file_path)
-    if not src.is_file():
-        raise FileNotFoundError(src)
-    name = f"{group}-{datetime.now():%Y%m%d%H%M%S}"
-    zip_path = Path(os.environ.get("TMPDIR", "/tmp")) / f"{name}.zip"
-    s = _session()
-    fmt = _fmt(s, format)
-    _build_package(src, group, zip_path, template_package, fmt)
-    if dry_run:
-        return f"Built {zip_path}"
-
-    exec_id = _import_package(s, zip_path, name, group, company, execute=True)
-    if not wait:
-        return f"Triggered {exec_id}"
-    deadline = time.time() + CFG["poll_timeout_seconds"]
-    while (st := _call(s, "GetExecutionSummaryStatus", {"executionId": exec_id})) not in DONE:
-        if time.time() > deadline:
-            return f"Triggered {exec_id}; still {st} after timeout, use get_import_status"
-        time.sleep(CFG["poll_interval_seconds"])
-    return f"{exec_id}: {st}"
-
-
-@mcp.tool()
-def create_data_project(name: str, company: str, template_package: str, description: str = "",
-                        format: str = "CSV") -> str:
-    """Create a new DMF *import* data project for the entity in `template_package` (a DMF package zip, e.g. saved by export_data).
-
-    Creates the project, then loads the template package into it without executing, which
-    defines the entity and field mapping from the package manifest. Fails if the name exists.
-    `format` (free text: "CSV" default, "EXCEL", or another D365 source format name) sets the project's source data format.
-    Afterwards use import_file(file_path, definition_group=name, ..., format=format).
-    """
-    s = _session()
-    fmt = _fmt(s, format)
+def _ensure_project(s, name: str, description: str = "", operation: str = "Import") -> bool:
+    """Create the data project if missing. Returns True if it was created."""
+    if _get(s, "DataManagementDefinitionGroups", **{"$filter": f"Name eq '{_q(name)}'", "$select": "Name"}):
+        return False
     r = s.post(BASE + "/data/DataManagementDefinitionGroups", json={
-        "Name": name, "OperationType": "Import", "ProjectCategory": "Integration",
-        "Description": description, "GenerateDataPackage": "No"})
+        "Name": name, "OperationType": operation, "ProjectCategory": "Integration",
+        "Description": description or name, "GenerateDataPackage": "No"})
     if not r.ok:
         raise RuntimeError(f"Create project failed: {r.status_code} {r.text}")
-    zip_path = Path(os.environ.get("TMPDIR", "/tmp")) / f"{name}-setup-{datetime.now():%Y%m%d%H%M%S}.zip"
-    with zipfile.ZipFile(_path(template_package)) as zin:
-        _build_package(Path(zin.extract(next(n for n in zin.namelist() if n.lower().endswith(".csv")),
-                                        zip_path.parent / "dmf-tpl")), name, zip_path, template_package, fmt)
-    _import_package(s, zip_path, zip_path.stem, name, company, execute=False)
+    return True
+
+
+# --------------------------------------------------------------------- tools
+
+@mcp.tool()
+def import_data(definition_group: str, company: str, files: list[EntityFile], format: str = "CSV",
+                wait: bool = True, dry_run: bool = False) -> str:
+    """Import one or more data files into D365 through a DMF data project, as the signed-in user.
+
+    `definition_group` is the data project name (created automatically if it doesn't exist),
+    `company` the legal entity id (e.g. USMF). `files` lists {entity, file_path} pairs: `entity`
+    is the DMF entity name as shown in D365 (e.g. "Customer groups"), `file_path` a .csv or .xlsx
+    whose first row holds the entity's field names (staging column names, e.g. CUSTOMERGROUPID).
+    Several entities can be imported in one call; D365 decides the order from their dependencies.
+    `format` is the file format in the package, free text and case-insensitive: "CSV" (default) and
+    "EXCEL" are the common ones; other CSV/Excel-based source formats on the environment
+    (e.g. "CSV-Unicode") also work. An unknown value returns the available ones.
+    Composite and XML-based entities are not supported.
+    With wait=True, polls until the import finishes (or the timeout); otherwise returns the
+    execution id to check with get_execution_status. dry_run only validates and builds the package.
+    """
+    if not files:
+        raise ValueError("files must contain at least one {entity, file_path}")
+    paths = {f.entity: _path(f.file_path) for f in files}
+    if len(paths) != len(files):
+        raise ValueError("each entity may appear only once per call")
+    for p in paths.values():
+        if not p.is_file():
+            raise FileNotFoundError(p)
+    s = _session()
+    fmt = _fmt(s, format)
+    entities = _resolve_entities(s, list(paths))
+    package = _build_package(definition_group, fmt, entities, paths)
+    if dry_run:
+        return f"OK: package for {', '.join(paths)} would be {len(package)} bytes ({fmt})"
+    _ensure_project(s, definition_group)
+
+    name = f"{definition_group}-{time.strftime('%Y%m%d%H%M%S')}"
+    blob = json.loads(_call(s, "GetAzureWriteUrl", {"uniqueFileName": name}))["BlobUrl"]
+    requests.put(blob, data=package, headers={"x-ms-blob-type": "BlockBlob"}).raise_for_status()
+    exec_id = f"mcp-{uuid.uuid4().hex[:12]}"
+    _call(s, "ImportFromPackage", dict(packageUrl=blob, definitionGroupId=definition_group, executionId=exec_id,
+                                       execute=True, overwrite=True, legalEntityId=company))
+    return _wait(s, exec_id) if wait else f"Triggered {exec_id}"
+
+
+@mcp.tool()
+def create_data_project(name: str, description: str = "") -> str:
+    """Create an empty DMF import data project. Optional: import_data creates the project itself
+    if it doesn't exist, and the first import defines its entities."""
+    if not _ensure_project(_session(), name, description):
+        raise RuntimeError(f"Data project '{name}' already exists")
     return f"Created data project {name}"
 
 
 @mcp.tool()
 def export_data(output_dir: str, definition_group: str, company: str) -> str:
-    """Run a DMF *export* data project and save the resulting package contents to output_dir.
+    """Run an existing DMF *export* data project and save its data files to output_dir.
 
-    The data files are saved in the project's own source format (CSV, Excel, ...), and the whole
-    package is saved as "<definition_group>-package.zip", usable as `template_package` for
-    import_file / create_data_project. Returns the saved file paths.
+    The files are saved in the project's own source format (CSV, Excel, ...). Returns the saved paths.
     """
-    group = definition_group
     s = _session()
     exec_id = f"mcp-{uuid.uuid4().hex[:12]}"
-    _call(s, "ExportToPackage", dict(definitionGroupId=group, packageName=exec_id, executionId=exec_id,
+    _call(s, "ExportToPackage", dict(definitionGroupId=definition_group, packageName=exec_id, executionId=exec_id,
                                      reExecute=False, legalEntityId=company))
-    deadline = time.time() + CFG["poll_timeout_seconds"]
-    while (st := _call(s, "GetExecutionSummaryStatus", {"executionId": exec_id})) not in DONE:
-        if time.time() > deadline:
-            return f"Export {exec_id} still {st} after timeout, use get_import_status"
-        time.sleep(CFG["poll_interval_seconds"])
-    if st != "Succeeded":
-        return f"Export {exec_id}: {st}"
+    result = _wait(s, exec_id)
+    if not result.endswith("Succeeded"):
+        return result
     r = requests.get(_call(s, "GetExportedPackageUrl", {"executionId": exec_id}))
     r.raise_for_status()
     out = _path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    pkg = out / f"{group}-package.zip"
-    pkg.write_bytes(r.content)
+    saved = []
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-        files = [n for n in z.namelist() if n not in ("Manifest.xml", "PackageHeader.xml")]
-        for n in files:
-            (out / Path(n).name).write_bytes(z.read(n))
-    return "Saved: " + ", ".join([str(pkg)] + [str(out / Path(n).name) for n in files])
+        for n in z.namelist():
+            if n not in ("Manifest.xml", "PackageHeader.xml"):
+                (out / Path(n).name).write_bytes(z.read(n))
+                saved.append(str(out / Path(n).name))
+    return "Saved: " + ", ".join(saved)
 
 
 @mcp.tool()
-def get_import_status(execution_id: str) -> str:
-    """Get the status of a DMF execution (NotRun, Executing, Succeeded, PartiallySucceeded, Failed, Canceled), with error details if it failed."""
+def get_execution_status(execution_id: str) -> str:
+    """Get the status of a DMF execution (NotRun, Executing, Succeeded, PartiallySucceeded, Failed,
+    Canceled), with error details if it failed."""
     s = _session()
     st = _call(s, "GetExecutionSummaryStatus", {"executionId": execution_id})
     if st in ("Failed", "PartiallySucceeded"):
