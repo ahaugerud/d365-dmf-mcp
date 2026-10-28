@@ -95,13 +95,22 @@ def _q(v: str) -> str:
     return v.replace("'", "''")
 
 
+def _details(s, exec_id: str, st: str) -> str:
+    """Per-entity status and error messages for executions that didn't fully succeed."""
+    if st not in ("Failed", "PartiallySucceeded"):
+        return ""
+    entities = _call(s, "GetEntityExecutionSummaryStatusList", {"executionId": exec_id})
+    errors = _call(s, "GetExecutionErrors", {"executionId": exec_id})
+    return f"\nEntities: {', '.join(entities)}\nErrors: {errors}"
+
+
 def _wait(s, exec_id: str) -> str:
     deadline = time.time() + POLL_TIMEOUT
     while (st := _call(s, "GetExecutionSummaryStatus", {"executionId": exec_id})) not in DONE:
         if time.time() > deadline:
             return f"{exec_id}: still {st} after timeout, use get_execution_status"
         time.sleep(POLL_INTERVAL)
-    return f"{exec_id}: {st}"
+    return f"{exec_id}: {st}{_details(s, exec_id, st)}"
 
 
 # ------------------------------------------------------------ files / formats
@@ -311,12 +320,10 @@ def export_data(output_dir: str, definition_group: str, company: str) -> str:
 @mcp.tool()
 def get_execution_status(execution_id: str) -> str:
     """Get the status of a DMF execution (NotRun, Executing, Succeeded, PartiallySucceeded, Failed,
-    Canceled), with error details if it failed."""
+    Canceled), with per-entity status and error messages if it failed."""
     s = _session()
     st = _call(s, "GetExecutionSummaryStatus", {"executionId": execution_id})
-    if st in ("Failed", "PartiallySucceeded"):
-        st += "\nErrors: " + _call(s, "GetExecutionErrors", {"executionId": execution_id})
-    return st
+    return f"{execution_id}: {st}{_details(s, execution_id, st)}"
 
 
 if __name__ == "__main__":
