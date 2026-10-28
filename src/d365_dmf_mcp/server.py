@@ -243,8 +243,10 @@ def import_data(definition_group: str, company: str, files: list[EntityFile], fo
 
     `definition_group` is the data project name (created automatically if it doesn't exist),
     `company` the legal entity id (e.g. USMF). `files` lists {entity, file_path} pairs: `entity`
-    is the DMF entity name as shown in D365 (e.g. "Customer groups"), `file_path` a .csv or .xlsx
-    whose first row holds the entity's field names (staging column names, e.g. CUSTOMERGROUPID).
+    is the DMF entity name as shown in D365 (e.g. "Customer groups"; find it with search_entities),
+    `file_path` a .csv or .xlsx
+    whose first row holds the entity's field names (staging column names, e.g. CUSTOMERGROUPID;
+    list them with get_entity_fields).
     Several entities can be imported in one call; D365 decides the order from their dependencies.
     `format` is the file format in the package, free text and case-insensitive: "CSV" (default) and
     "EXCEL" are the common ones; other CSV/Excel-based source formats on the environment
@@ -320,6 +322,70 @@ def get_execution_status(execution_id: str) -> str:
     s = _session()
     st = _call(s, "GetExecutionSummaryStatus", {"executionId": execution_id})
     return f"{execution_id}: {st}{_details(s, execution_id, st)}"
+
+
+@mcp.tool()
+def list_data_projects(name_filter: str = "", operation_type: str = "") -> str:
+    """List existing DMF data projects (name, Import/Export, description).
+
+    `name_filter` is a case-insensitive substring of the name or description; `operation_type`
+    optionally restricts to "Import" or "Export". Use the names with import_data / export_data."""
+    rows = _get(_session(), "DataManagementDefinitionGroups", **{"$select": "Name,OperationType,Description"})
+    f = name_filter.strip().lower()
+    hits = sorted((r for r in rows
+                   if (not f or f in r["Name"].lower() or f in (r["Description"] or "").lower())
+                   and (not operation_type or r["OperationType"].lower() == operation_type.strip().lower())),
+                  key=lambda r: r["Name"].lower())
+    if not hits:
+        return "No matching data projects"
+    lines = [f"{r['Name']} [{r['OperationType']}]" + (f" - {r['Description']}" if r["Description"] and r["Description"] != r["Name"] else "")
+             for r in hits[:100]]
+    return f"{len(hits)} data project(s)" + (" (showing 100, narrow with name_filter)" if len(hits) > 100 else "") + ":\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def list_project_entities(definition_group: str) -> str:
+    """List the entities defined in a DMF data project, with source format and execution order
+    (unit/level/sequence)."""
+    rows = _get(_session(), "DataManagementDefinitionGroupDetails", **{
+        "$filter": f"DefinitionGroupId eq '{_q(definition_group)}'",
+        "$select": "EntityName,SourceFormat,ExecutionUnit,LevelInExecutionUnit,SequenceInLevel"})
+    if not rows:
+        return f"No entities in '{definition_group}' (project missing or empty; see list_data_projects)"
+    rows.sort(key=lambda r: (r["ExecutionUnit"], r["LevelInExecutionUnit"], r["SequenceInLevel"]))
+    return "\n".join(f"{r['EntityName']} [{r['SourceFormat']}] unit {r['ExecutionUnit']} level {r['LevelInExecutionUnit']} seq {r['SequenceInLevel']}"
+                     for r in rows)
+
+
+@mcp.tool()
+def search_entities(query: str, limit: int = 50) -> str:
+    """Search the DMF entity catalogue by case-insensitive substring of the entity name, target
+    entity or module (e.g. "customer", "AccountsReceivable"). Returns entity names to use with
+    import_data, plus category and module. Composite entities (X composite) are not importable here."""
+    rows = _get(_session(), "DataManagementEntities", **{"$select": "EntityName,TargetName,Category,Modules,EntityIsEnabled"})
+    q = query.strip().lower()
+    hits = sorted((r for r in rows if q in f"{r['EntityName']} {r['TargetName']} {r['Modules']}".lower()),
+                  key=lambda r: r["EntityName"].lower())
+    if not hits:
+        return "No matching entities"
+    lines = [f"{r['EntityName']} ({r['Category']}, {r['Modules'] or '-'})" + ("" if r["EntityIsEnabled"] == "Yes" else " [disabled]")
+             for r in hits[:limit]]
+    return f"{len(hits)} entit(y/ies)" + (f", showing {limit}" if len(hits) > limit else "") + ":\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def get_entity_fields(entity: str) -> str:
+    """List the importable columns of a DMF entity: the staging column names to use as the header
+    row of the data file, with data type, max length and whether D365 flags the field as required.
+    System-managed fields are omitted."""
+    rows = _get(_session(), "DataManagementTargetMapEntities", **{
+        "$filter": f"Entity eq '{_q(entity)}'",
+        "$select": "StagingField,IsRequired,FieldDataTypeValue,FieldLength,IsSystem,isFieldEnabled"})
+    if not rows:
+        return f"Unknown entity '{entity}' (see search_entities)"
+    return "\n".join(f"{r['StagingField']} {r['FieldDataTypeValue']}" + (f"({r['FieldLength']})" if r["FieldLength"] else "")
+                     + (" required" if r["IsRequired"] == "Yes" else "")
+                     for r in rows if r["IsSystem"] != "Yes" and r["isFieldEnabled"] == "Yes")
 
 
 def main() -> None:
