@@ -1,0 +1,9 @@
+{
+  "base_url": "https://inspirit365-contoso.sandbox.operations.eu.dynamics.com",
+  "definition_group": "POC-CustomerGroups-Import",
+  "export_group_name": "POC-CustomerGroups-Export",
+  "company": "USMF",
+  "template_zip": "template/CustomerGroups-export.zip",
+  "poll_interval_seconds": 5,
+  "poll_timeout_seconds": 300
+}
