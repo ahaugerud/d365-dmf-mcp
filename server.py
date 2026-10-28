@@ -1,20 +1,24 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests", "mcp<2", "openpyxl"]
+# dependencies = ["requests", "mcp<2", "openpyxl", "azure-identity>=1.25.3"]
 # ///
 """MVP MCP server: upload a CSV to a D365 F&O Data Management (DMF) import project.
 
-Auth is the signed-in user's `az login`. Config comes from env vars (set them in the
-`env` block of the MCP server definition, see .mcp.json.example):
-  DMF_BASE_URL, DMF_DEFINITION_GROUP, DMF_COMPANY, DMF_TEMPLATE_ZIP, DMF_EXPORT_GROUP_NAME
+Auth is delegated Entra ID as the signed-in user: `az login` if available, otherwise an
+interactive browser login (same mechanism as sql-server-mcp), pinned to DMF_AZURE_TENANT_ID.
+Config comes from env vars (set them in the `env` block of the MCP server definition, see .mcp.json.example):
+  DMF_AZURE_TENANT_ID, DMF_BASE_URL, DMF_DEFINITION_GROUP, DMF_COMPANY,
+  DMF_TEMPLATE_ZIP, DMF_EXPORT_GROUP_NAME
   (optional: DMF_POLL_INTERVAL_SECONDS=5, DMF_POLL_TIMEOUT_SECONDS=300)
 Relative paths resolve against this script's directory.
 """
-import csv, io, json, os, re, subprocess, time, uuid, zipfile
+import csv, io, json, os, re, sys, time, uuid, zipfile
 from datetime import datetime
 from pathlib import Path
 
 import requests
+from azure.core.exceptions import ClientAuthenticationError
+from azure.identity import AzureCliCredential, InteractiveBrowserCredential
 from openpyxl import Workbook, load_workbook
 from mcp.server.fastmcp import FastMCP
 
@@ -29,6 +33,7 @@ def _env(key: str, default: str | None = None) -> str:
 
 
 CFG = {
+    "tenant_id": _env("DMF_AZURE_TENANT_ID"),
     "base_url": _env("DMF_BASE_URL"),
     "definition_group": _env("DMF_DEFINITION_GROUP"),
     "company": _env("DMF_COMPANY"),
@@ -49,12 +54,29 @@ def _path(p: str) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
+_credential = None
+
+
+def _token() -> str:
+    """Token for the D365 environment. Resolution (az-cli, falling back to an interactive
+    browser login) is deferred to the first call so the stdio handshake isn't blocked on login."""
+    global _credential
+    scope = BASE + "/.default"
+    if _credential is None:
+        cli = AzureCliCredential(tenant_id=CFG["tenant_id"])
+        try:
+            cli.get_token(scope)
+            _credential = cli
+        except ClientAuthenticationError:
+            sys.stderr.write(f"No active `az login` session for tenant {CFG['tenant_id']!r} - "
+                             "falling back to an interactive browser login.\n")
+            _credential = InteractiveBrowserCredential(tenant_id=CFG["tenant_id"])
+    return _credential.get_token(scope).token
+
+
 def _session() -> requests.Session:
-    token = subprocess.run(
-        ["az", "account", "get-access-token", "--resource", BASE, "--query", "accessToken", "-o", "tsv"],
-        capture_output=True, text=True, check=True).stdout.strip()
     s = requests.Session()
-    s.headers["Authorization"] = f"Bearer {token}"
+    s.headers["Authorization"] = f"Bearer {_token()}"
     return s
 
 

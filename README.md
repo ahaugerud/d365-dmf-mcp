@@ -10,10 +10,10 @@ MCP server that imports CSV files into Dynamics 365 F&O via Data Management (DMF
    winget install astral-sh.uv Microsoft.AzureCLI
    ```
 
-2. Sign in with the account that has access to D365:
+2. Sign in with the account that has access to D365 (if there is no `az` session, the server falls back to an interactive browser login):
 
    ```powershell
-   az login
+   az login --tenant <entra-tenant-id>
    ```
 
 3. Clone this repo:
@@ -26,6 +26,7 @@ MCP server that imports CSV files into Dynamics 365 F&O via Data Management (DMF
 
    ```powershell
    claude mcp add d365-dmf `
+     -e DMF_AZURE_TENANT_ID=<entra-tenant-id> `
      -e DMF_BASE_URL=https://<env>.sandbox.operations.eu.dynamics.com `
      -e DMF_DEFINITION_GROUP=POC-CustomerGroups-Import `
      -e DMF_EXPORT_GROUP_NAME=POC-CustomerGroups-Export `

@@ -4,6 +4,7 @@
       "command": "uv",
       "args": ["run", "--script", "/path/to/d365-dmf-mcp/server.py"],
       "env": {
+        "DMF_AZURE_TENANT_ID": "<entra-tenant-id>",
         "DMF_BASE_URL": "https://<env>.sandbox.operations.eu.dynamics.com",
         "DMF_DEFINITION_GROUP": "POC-CustomerGroups-Import",
         "DMF_EXPORT_GROUP_NAME": "POC-CustomerGroups-Export",
