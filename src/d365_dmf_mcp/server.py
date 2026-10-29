@@ -343,18 +343,85 @@ def list_data_projects(name_filter: str = "", operation_type: str = "") -> str:
     return f"{len(hits)} data project(s)" + (" (showing 100, narrow with name_filter)" if len(hits) > 100 else "") + ":\n" + "\n".join(lines)
 
 
+_FLAGS = {  # tool argument -> DataManagementDefinitionGroupDetails field
+    "run_business_validation": "RunBusinessValidation",
+    "run_validate_field": "RunValidateField",
+    "run_business_logic": "RunBusinessLogic",
+    "skip_staging": "SkipStaging",
+    "fail_level_on_error": "FailLevelOnError",
+    "fail_execution_unit_on_error": "FailExecutionUnitOnError",
+}
+_DEFAULTS = {"RunBusinessValidation": "Yes", "RunValidateField": "Yes", "RunBusinessLogic": "Yes",
+             "SkipStaging": "No", "FailLevelOnError": "No", "FailExecutionUnitOnError": "No"}
+
+
+def _entity_row(s, group: str, entity: str) -> dict:
+    rows = _get(s, "DataManagementDefinitionGroupDetails", **{
+        "$filter": f"DefinitionGroupId eq '{_q(group)}' and EntityName eq '{_q(entity)}'",
+        "$select": ",".join(_FLAGS.values())})
+    if not rows:
+        raise ValueError(f"Entity '{entity}' is not in data project '{group}' (see list_project_entities)")
+    return rows[0]
+
+
+def _flags_text(row: dict) -> str:
+    changed = [f"{k}={row[k]}" for k, d in _DEFAULTS.items() if row[k] != d]
+    return ", ".join(changed) if changed else "default settings"
+
+
 @mcp.tool()
 def list_project_entities(definition_group: str) -> str:
-    """List the entities defined in a DMF data project, with source format and execution order
-    (unit/level/sequence)."""
+    """List the entities defined in a DMF data project, with source format, execution order
+    (unit/level/sequence) and any non-default processing settings (see configure_project_entity)."""
     rows = _get(_session(), "DataManagementDefinitionGroupDetails", **{
         "$filter": f"DefinitionGroupId eq '{_q(definition_group)}'",
-        "$select": "EntityName,SourceFormat,ExecutionUnit,LevelInExecutionUnit,SequenceInLevel"})
+        "$select": "EntityName,SourceFormat,ExecutionUnit,LevelInExecutionUnit,SequenceInLevel," + ",".join(_FLAGS.values())})
     if not rows:
         return f"No entities in '{definition_group}' (project missing or empty; see list_data_projects)"
     rows.sort(key=lambda r: (r["ExecutionUnit"], r["LevelInExecutionUnit"], r["SequenceInLevel"]))
-    return "\n".join(f"{r['EntityName']} [{r['SourceFormat']}] unit {r['ExecutionUnit']} level {r['LevelInExecutionUnit']} seq {r['SequenceInLevel']}"
-                     for r in rows)
+    return "\n".join(f"{r['EntityName']} [{r['SourceFormat']}] unit {r['ExecutionUnit']} level {r['LevelInExecutionUnit']} "
+                     f"seq {r['SequenceInLevel']} ({_flags_text(r)})" for r in rows)
+
+
+@mcp.tool()
+def configure_project_entity(definition_group: str, entity: str,
+                             run_business_validation: bool | None = None,
+                             run_validate_field: bool | None = None,
+                             run_business_logic: bool | None = None,
+                             skip_staging: bool | None = None,
+                             fail_level_on_error: bool | None = None,
+                             fail_execution_unit_on_error: bool | None = None) -> str:
+    """Show or change the processing settings of one entity in a DMF data project. Only the
+    arguments you pass are changed (none = just show the current settings); the entity must already
+    be in the project (import_data adds it on first use). Settings persist across later imports.
+
+    D365 defaults (and the right choice for almost every import): run_business_validation=True
+    (table validateWrite + event handlers), run_validate_field=True (per-field validateField),
+    run_business_logic=True (table insert()/update() logic), skip_staging=False,
+    fail_level_on_error=False / fail_execution_unit_on_error=False (keep going, report bad rows as
+    PartiallySucceeded). RECOMMENDATIONS: leave the defaults. Only turn validations/business logic
+    off for large one-off migration loads of data that already imported cleanly in a test run, and
+    tell the user first, since the target then accepts data the UI would reject. skip_staging
+    (write straight to the target) is faster but only works for entities that support it and gives
+    less error detail. Set the fail_* flags to True when later rows or entities are meaningless if
+    one fails (level = same dependency level, execution unit = the whole dependency chain).
+
+    Not controllable here (no API; D365 UI only, Data management > Framework parameters > Entity
+    settings > Configure entity execution parameters): Import threshold record count (records per
+    task) and Import task count (parallel tasks, max = batch threads per server x batch servers),
+    plus set-based processing and change tracking on the entity. For big files, point the user to
+    those, and note that imports only parallelise when run as a batch job (ImportFromPackage does)."""
+    s = _session()
+    row = _entity_row(s, definition_group, entity)
+    args = locals()
+    patch = {field: ("Yes" if args[arg] else "No") for arg, field in _FLAGS.items() if args[arg] is not None}
+    if not patch:
+        return f"{entity} in {definition_group}: {_flags_text(row)}"
+    r = s.patch(BASE + f"/data/DataManagementDefinitionGroupDetails(DefinitionGroupId='{_q(definition_group)}',"
+                       f"EntityName='{_q(entity)}')", json=patch)
+    if not r.ok:
+        raise RuntimeError(f"Update failed: {r.status_code} {r.text}")
+    return f"{entity} in {definition_group}: {_flags_text(row)} -> {_flags_text(_entity_row(s, definition_group, entity))}"
 
 
 @mcp.tool()

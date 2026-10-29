@@ -35,12 +35,15 @@ Only the tenant and environment URL are config. Everything else is passed per ca
 - `export_data(output_dir, definition_group, company)`: run an existing export data project and save its files.
 - `create_data_project(name, description="")`: create an empty import data project (optional; `import_data` does this itself).
 - `list_data_projects(name_filter="", operation_type="")`: browse existing data projects.
-- `list_project_entities(definition_group)`: the entities in a project, with format and execution order.
+- `list_project_entities(definition_group)`: the entities in a project, with format, execution order and any non-default processing settings.
+- `configure_project_entity(definition_group, entity, ...)`: show/change per-entity settings (business validation, field validation, business logic, skip staging, fail-on-error). Defaults are right for almost all imports; only relax validation for large, already-tested migration loads.
 - `search_entities(query, limit=50)`: search the DMF entity catalogue by name, target entity or module.
 - `get_entity_fields(entity)`: the column names (data file header), types, lengths and required flags for an entity.
 - `get_execution_status(execution_id)`: check the status of an execution, with errors if it failed.
 
 ## Notes
+
+- Import threshold record count, import task count (parallelism), set-based processing and change tracking have no API; set them in D365 (Data management > Framework parameters > Entity settings > Configure entity execution parameters) for large loads.
 
 - Composite and XML-based entities are not supported.
 - Optional env vars: `DMF_POLL_INTERVAL_SECONDS` (default 5), `DMF_POLL_TIMEOUT_SECONDS` (default 300).
